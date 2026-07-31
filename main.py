@@ -1,18 +1,12 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional
+from database import get_connection, init_db
 
 app = FastAPI()
-
-# ---------- In-memory data ----------
-tasks = [
-    {"id": 1, "title": "Buy milk", "done": False},
-    {"id": 2, "title": "Walk dog", "done": True},
-    {"id": 3, "title": "Write code", "done": False},
-]
+init_db()
 
 
-# ---------- Models ----------
 class TaskCreate(BaseModel):
     title: Optional[str] = None
 
@@ -22,10 +16,13 @@ class TaskUpdate(BaseModel):
     done: Optional[bool] = None
 
 
-# ---------- Stage 1: root & health ----------
+def row_to_task(row):
+    return {"id": row["id"], "title": row["title"], "done": bool(row["done"])}
+
+
 @app.get("/", summary="API info")
 def root():
-    return {"name": "Task API", "version": "1.0", "endpoints": ["/tasks"]}
+    return {"name": "Task API", "version": "2.0 (SQLite)", "endpoints": ["/tasks"]}
 
 
 @app.get("/health", summary="Health check")
@@ -33,74 +30,129 @@ def health():
     return {"status": "ok"}
 
 
-# ---------- Stage 2: read ----------
 @app.get("/tasks", summary="List all tasks (supports filtering & search)")
 def get_tasks(done: Optional[bool] = None, search: Optional[str] = None):
-    result = tasks
+    conn = get_connection()
+    cur = conn.cursor()
+
+    query = "SELECT * FROM tasks WHERE 1=1"
+    params = []
+
     if done is not None:
-        result = [t for t in result if t["done"] == done]
+        query += " AND done = ?"
+        params.append(1 if done else 0)
+
     if search:
-        result = [t for t in result if search.lower() in t["title"].lower()]
-    return result
+        query += " AND title LIKE ?"
+        params.append(f"%{search}%")
+
+    cur.execute(query, params)
+    rows = cur.fetchall()
+    conn.close()
+    return [row_to_task(r) for r in rows]
 
 
 @app.get("/tasks/{task_id}", summary="Get a single task")
 def get_task(task_id: int):
-    for t in tasks:
-        if t["id"] == task_id:
-            return t
-    raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
+    row = cur.fetchone()
+    conn.close()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return row_to_task(row)
 
 
-# ---------- Stage 3: create ----------
 @app.post("/tasks", status_code=201, summary="Create a new task")
 def create_task(task: TaskCreate):
     if not task.title or not task.title.strip():
         raise HTTPException(status_code=400, detail="Title is required")
-    new_id = max([t["id"] for t in tasks], default=0) + 1
-    new_task = {"id": new_id, "title": task.title, "done": False}
-    tasks.append(new_task)
-    return new_task
+
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO tasks (title, done) VALUES (?, ?)", (task.title, 0))
+    conn.commit()
+    new_id = cur.lastrowid
+    cur.execute("SELECT * FROM tasks WHERE id = ?", (new_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row_to_task(row)
 
 
-# ---------- Stage 4: update & delete ----------
 @app.put("/tasks/{task_id}", summary="Update a task")
 def update_task(task_id: int, update: TaskUpdate):
-    for t in tasks:
-        if t["id"] == task_id:
-            if update.title is not None:
-                if not update.title.strip():
-                    raise HTTPException(status_code=400, detail="Title cannot be empty")
-                t["title"] = update.title
-            if update.done is not None:
-                t["done"] = update.done
-            return t
-    raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
+    row = cur.fetchone()
+    if row is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    new_title = row["title"]
+    new_done = row["done"]
+
+    if update.title is not None:
+        if not update.title.strip():
+            conn.close()
+            raise HTTPException(status_code=400, detail="Title cannot be empty")
+        new_title = update.title
+
+    if update.done is not None:
+        new_done = 1 if update.done else 0
+
+    cur.execute(
+        "UPDATE tasks SET title = ?, done = ? WHERE id = ?",
+        (new_title, new_done, task_id),
+    )
+    conn.commit()
+    cur.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
+    updated = cur.fetchone()
+    conn.close()
+    return row_to_task(updated)
 
 
 @app.delete("/tasks/{task_id}", status_code=204, summary="Delete a task")
 def delete_task(task_id: int):
-    for i, t in enumerate(tasks):
-        if t["id"] == task_id:
-            tasks.pop(i)
-            return
-    raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM tasks WHERE id = ?", (task_id,))
+    row = cur.fetchone()
+    if row is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Task not found")
+    cur.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+    conn.commit()
+    conn.close()
+    return
 
 
-# ---------- Optional extras ----------
 @app.get("/stats", summary="Task statistics")
 def stats():
-    total = len(tasks)
-    done_count = sum(1 for t in tasks if t["done"])
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM tasks")
+    total = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM tasks WHERE done = 1")
+    done_count = cur.fetchone()[0]
+    conn.close()
     return {"total": total, "done": done_count, "open": total - done_count}
 
 
 @app.post("/reset", summary="Reset tasks to seed data")
 def reset():
-    global tasks
-    tasks = [
-        {"id": 1, "title": "Buy milk", "done": False},
-        {"id": 2, "title": "Walk dog", "done": True},
-        {"id": 3, "title": "Write code", "done": False},
-    ]
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM tasks")
+    cur.executemany(
+        "INSERT INTO tasks (title, done) VALUES (?, ?)",
+        [
+            ("Buy milk", 0),
+            ("Walk dog", 1),
+            ("Write code", 0),
+        ],
+    )
+    conn.commit()
+    conn.close()
     return {"message": "reset done"}
