@@ -4,7 +4,7 @@ from supabase import create_client, Client
 
 load_dotenv()
 supabase: Client = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Header
 from pydantic import BaseModel
 
 router = APIRouter()
@@ -35,3 +35,15 @@ def login(body: AuthBody):
         }
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid login credentials")
+   
+
+@router.get("/public/info")
+def public_info():
+    return {"message": "Welcome stranger! This info is public."}
+
+@router.get("/protected/profile")
+def profile(authorization: str = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Access token required")
+    token = authorization.split(" ")[1]
+    return {"token_received": token}
