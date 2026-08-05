@@ -46,4 +46,11 @@ def profile(authorization: str = Header(None)):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Access token required")
     token = authorization.split(" ")[1]
-    return {"token_received": token}
+    try:
+        user_response = supabase.auth.get_user(token)
+        user = user_response.user
+        if not user:
+            raise Exception("no user")
+        return {"id": user.id, "email": user.email, "created_at": str(user.created_at)}
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
