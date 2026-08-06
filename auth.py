@@ -4,14 +4,19 @@ from supabase import create_client, Client
 
 load_dotenv()
 supabase: Client = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
-from fastapi import APIRouter, HTTPException, Header
+
+from fastapi import APIRouter, HTTPException, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
 router = APIRouter()
+security = HTTPBearer()
+
 
 class AuthBody(BaseModel):
     email: str
     password: str
+
 
 @router.post("/auth/signup", status_code=201)
 def signup(body: AuthBody):
@@ -22,6 +27,7 @@ def signup(body: AuthBody):
         return result.user
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
 
 @router.post("/auth/login")
 def login(body: AuthBody):
@@ -35,22 +41,36 @@ def login(body: AuthBody):
         }
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid login credentials")
-   
+
 
 @router.get("/public/info")
 def public_info():
     return {"message": "Welcome stranger! This info is public."}
 
-@router.get("/protected/profile")
-def profile(authorization: str = Header(None)):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Access token required")
-    token = authorization.split(" ")[1]
+
+def get_current_user(creds: HTTPAuthorizationCredentials = Depends(security)):
+    token = creds.credentials
     try:
         user_response = supabase.auth.get_user(token)
         user = user_response.user
         if not user:
             raise Exception("no user")
-        return {"id": user.id, "email": user.email, "created_at": str(user.created_at)}
+        return user
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+
+@router.get("/protected/profile")
+def profile(user=Depends(get_current_user)):
+    return {"id": user.id, "email": user.email, "created_at": str(user.created_at)}
+
+
+@router.get("/protected/dashboard")
+def dashboard(user=Depends(get_current_user)):
+    return {"message": f"Welcome to your dashboard, {user.email}"}
+
+
+@router.post("/auth/logout", status_code=204)
+def logout(user=Depends(get_current_user)):
+    supabase.auth.sign_out()
+    return
