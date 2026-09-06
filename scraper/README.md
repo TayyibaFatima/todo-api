@@ -110,9 +110,7 @@ All the book data (title, price, availability, description) is present directly 
 
 
 
-\[Write one honest one — e.g. "Retries only happen once, not with exponential backoff" or "The scraper doesn't yet detect changed records between runs."]
-
-
+Retries only happen once (not with exponential backoff), and the scraper doesn't yet detect which records changed between runs — a rerun overwrites `books.json` with a fresh copy rather than diffing against the previous one.
 
 \## Ethics note
 
