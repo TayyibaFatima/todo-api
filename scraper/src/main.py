@@ -2,12 +2,12 @@ import os
 import time
 import re
 from datetime import datetime, timezone
-from urllib.parse import urljoin
 import json
 import requests
 from bs4 import BeautifulSoup
 from pydantic import BaseModel, ValidationError, HttpUrl
 from typing import Optional
+from urllib.parse import urljoin
 
 CACHE_DIR = "cache"
 OUTPUT_DIR = "output"
@@ -30,21 +30,41 @@ class BookRecord(BaseModel):
     fetched_at: str
 
 
-# ---------- Fetch ----------
+# ---------- Fetch (with retry) ----------
 
-def fetch_page(url: str, cache_filename: str) -> str:
-    """Fetch a page, using the cache if it already exists."""
+def fetch_page(url: str, cache_filename: str, retry: bool = True) -> tuple[str, bool]:
+    """
+    Fetch a page, using the cache if it exists.
+    Returns (html, was_cache_hit). Raises RuntimeError on unrecoverable failure.
+    """
     cache_path = os.path.join(CACHE_DIR, cache_filename)
 
     if os.path.exists(cache_path):
         with open(cache_path, "r", encoding="utf-8") as f:
             html = f.read()
         print(f"CACHE HIT: {cache_filename} ({len(html)} bytes)")
-        return html
+        return html, True
 
     headers = {"User-Agent": USER_AGENT}
-    response = requests.get(url, headers=headers, timeout=TIMEOUT)
-    response.encoding = "utf-8"  # fixes the "Â£" mangled-encoding issue
+
+    try:
+        response = requests.get(url, headers=headers, timeout=TIMEOUT)
+    except requests.exceptions.Timeout:
+        if retry:
+            print(f"TIMEOUT on {url}, retrying once...")
+            time.sleep(1)
+            return fetch_page(url, cache_filename, retry=False)
+        raise RuntimeError(f"Timed out twice fetching {url}")
+
+    response.encoding = "utf-8"
+
+    if response.status_code in (404, 403):
+        raise RuntimeError(f"Fetch refused for {url}: status {response.status_code}")
+
+    if response.status_code >= 500 and retry:
+        print(f"SERVER ERROR {response.status_code} on {url}, retrying once...")
+        time.sleep(1)
+        return fetch_page(url, cache_filename, retry=False)
 
     if response.status_code != 200:
         raise RuntimeError(f"Failed to fetch {url}: status {response.status_code}")
@@ -56,7 +76,7 @@ def fetch_page(url: str, cache_filename: str) -> str:
 
     print(f"FETCH: {cache_filename} ({len(html)} bytes)")
     time.sleep(DELAY)
-    return html
+    return html, False
 
 
 # ---------- Stage 2: discovery ----------
@@ -66,10 +86,13 @@ def discover_catalogue_pages():
     page_url = base_url
     page_num = 1
     all_book_urls = []
+    cache_hits = 0
 
     while True:
         cache_filename = f"catalogue-page-{page_num}.html"
-        html = fetch_page(page_url, cache_filename)
+        html, was_cache_hit = fetch_page(page_url, cache_filename)
+        if was_cache_hit:
+            cache_hits += 1
         soup = BeautifulSoup(html, "html.parser")
 
         for h3 in soup.select("article.product_pod h3 a"):
@@ -87,7 +110,7 @@ def discover_catalogue_pages():
 
     unique_urls = list(dict.fromkeys(all_book_urls))
     print(f"catalogue_pages={page_num} discovered={len(all_book_urls)} unique_urls={len(unique_urls)}")
-    return unique_urls
+    return unique_urls, page_num, cache_hits
 
 
 # ---------- Stage 3: extraction ----------
@@ -97,11 +120,17 @@ def safe_filename_from_url(url: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]", "_", slug) + ".html"
 
 
-def extract_book(book_url: str, source_page: str) -> dict:
+def extract_book(book_url: str, source_page: str) -> tuple[Optional[dict], bool]:
+    """Returns (record_or_none, was_cache_hit). record is None if the page failed."""
     cache_filename = safe_filename_from_url(book_url)
-    html = fetch_page(book_url, cache_filename)
-    soup = BeautifulSoup(html, "html.parser")
 
+    try:
+        html, was_cache_hit = fetch_page(book_url, cache_filename)
+    except RuntimeError as e:
+        print(f"FAILED PAGE: {book_url} ({e})")
+        return None, False
+
+    soup = BeautifulSoup(html, "html.parser")
     product_main = soup.select_one("div.product_main")
     title = product_main.select_one("h1").get_text(strip=True)
     price_text = product_main.select_one("p.price_color").get_text(strip=True)
@@ -120,7 +149,7 @@ def extract_book(book_url: str, source_page: str) -> dict:
     else:
         description = None
 
-    return {
+    record = {
         "title": title,
         "product_url": book_url,
         "price_text": price_text,
@@ -130,12 +159,12 @@ def extract_book(book_url: str, source_page: str) -> dict:
         "source_page": source_page,
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
+    return record, was_cache_hit
 
 
 # ---------- Stage 4: normalize + validate ----------
 
 def normalize_price(price_text: str) -> float:
-    """Turn '£51.77' (or a mangled 'Â£51.77') into 51.77."""
     cleaned = re.sub(r"[^\d.]", "", price_text)
     return float(cleaned)
 
@@ -148,11 +177,10 @@ def normalize_and_validate(raw_records: list[dict]):
     for raw in raw_records:
         try:
             if raw["product_url"] in seen_urls:
-                continue  # skip duplicates by canonical URL
+                continue
             seen_urls.add(raw["product_url"])
 
             price_gbp = normalize_price(raw["price_text"])
-
             record_data = dict(raw)
             record_data["price_gbp"] = price_gbp
 
@@ -168,14 +196,27 @@ def normalize_and_validate(raw_records: list[dict]):
 # ---------- Main ----------
 
 if __name__ == "__main__":
-    book_urls = discover_catalogue_pages()
+    run_start = datetime.now(timezone.utc)
+
+    book_urls, catalogue_pages_fetched, catalogue_cache_hits = discover_catalogue_pages()
+
+    # Stage 5 proof: add one fake URL on purpose
+    book_urls.append("https://books.toscrape.com/catalogue/this-book-does-not-exist_0000/index.html")
 
     raw_records = []
+    failed_pages = 0
+    detail_cache_hits = 0
+
     for url in book_urls:
-        record = extract_book(url, source_page="https://books.toscrape.com/catalogue/page-1.html")
+        record, was_cache_hit = extract_book(url, source_page="https://books.toscrape.com/catalogue/page-1.html")
+        if record is None:
+            failed_pages += 1
+            continue
+        if was_cache_hit:
+            detail_cache_hits += 1
         raw_records.append(record)
 
-    print(f"detail_pages={len(raw_records)}")
+    print(f"detail_pages={len(raw_records)} failed_pages={failed_pages}")
 
     valid_records, invalid_records = normalize_and_validate(raw_records)
 
@@ -186,4 +227,18 @@ if __name__ == "__main__":
     with open(os.path.join(OUTPUT_DIR, "errors.json"), "w", encoding="utf-8") as f:
         json.dump(invalid_records, f, indent=2, ensure_ascii=False)
 
-    print(f"valid_records={len(valid_records)} invalid_records={len(invalid_records)}")
+    run_end = datetime.now(timezone.utc)
+
+    run_report = {
+        "start_time": run_start.isoformat(),
+        "duration_seconds": (run_end - run_start).total_seconds(),
+        "catalogue_pages_fetched": catalogue_pages_fetched,
+        "cache_hits": catalogue_cache_hits + detail_cache_hits,
+        "valid_records": len(valid_records),
+        "invalid_records": len(invalid_records),
+        "failed_pages": failed_pages,
+    }
+    with open(os.path.join(OUTPUT_DIR, "run-report.json"), "w", encoding="utf-8") as f:
+        json.dump(run_report, f, indent=2)
+
+    print(f"valid_records={len(valid_records)} invalid_records={len(invalid_records)} failed_pages={failed_pages}")
