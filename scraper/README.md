@@ -14,7 +14,7 @@
 
 \- \*\*Data collected:\*\* Book title, price, availability, star rating, description, and page URLs — all publicly displayed on the page for anyone visiting.
 
-\- \*\*robots.txt result:\*\* \[no robots file found] OR \[paste what you actually saw]
+\- \*\*robots.txt result:\*\* no robots file found
 
 \- \*\*Note:\*\* I will not reuse this code on another site without checking its rules and terms first.
 
